@@ -2,9 +2,9 @@ suppressMessages(suppressWarnings(library(tidyverse)))
 suppressMessages(suppressWarnings(library(Seurat)))
 suppressMessages(suppressWarnings(library(optparse)))
 suppressMessages(suppressWarnings(library(magrittr)))
-suppressMessages(suppressWarnings(library(writexl)))
 suppressMessages(suppressWarnings(library(rmarkdown)))
 suppressMessages(suppressWarnings(library(plotly)))
+suppressMessages(suppressWarnings(library(openxlsx)))
 
 ## ===== define a function of the analysis ===== ##
 write_degsmith_report_rmd <- function(rmd_path,
@@ -46,9 +46,20 @@ write_degsmith_report_rmd <- function(rmd_path,
     "",
     "`%||%` <- function(x, y) if (is.null(x)) y else x",
     "",
-    "cond1 <- results$params$condition_1",
-    "cond2 <- results$params$condition_2",
+    "contrast1 <- results$params$contrast_1",
+    "contrast2 <- results$params$contrast_2",
+    "comparison_label <- results$params$comparison_label",
     "table_choice <- results$volcano_table %||% 'specific'",
+    "",
+    "comparison_mode <- results$params$comparison_mode",
+    "",
+    "make_title <- function(ct = NULL) {",
+    "  if (comparison_mode == 'population') {",
+    "    paste0('DEGSmith: ', comparison_label)",
+    "  } else {",
+    "    paste0('DEGSmith: ', ct, ' | ', comparison_label)",
+    "  }",
+    "}",
     "",
     paste0("VOLCANO_LOGFC <- ", volcano_logfc),
     paste0("VOLCANO_PADJ  <- ", volcano_padj),
@@ -64,8 +75,8 @@ write_degsmith_report_rmd <- function(rmd_path,
     "",
     "  degs <- degs %>% mutate(p_val_adj = ifelse(p_val_adj == 0, .Machine$double.xmin, p_val_adj))",
     "",
-    "  up_lab   <- paste0('Upregulated in ', cond1)",
-    "  down_lab <- paste0('Downregulated in ', cond1)",
+    "  up_lab   <- paste0('Higher in ', contrast1)",
+    "  down_lab <- paste0('Higher in ', contrast2)",
     "",
     "  degs_vp <- degs %>%",
     "    mutate(significance = case_when(",
@@ -145,7 +156,7 @@ write_degsmith_report_rmd <- function(rmd_path,
     "",
     "if (!is.null(ct_param) && nzchar(ct_param)) {",
     "  degs <- plot_list[[ct_param]]",
-    "  w <- volcano_plot(degs, paste0('DEGSmith: ', ct_param, ' | ', cond1, ' vs ', cond2))",
+    "  w <- volcano_plot(degs, make_title(ct_param))",
     "",
     "  cat('## ', ct_param, '\\n\\n', sep='')",
     "",
@@ -162,14 +173,19 @@ write_degsmith_report_rmd <- function(rmd_path,
     "",
     "} else if (mode == 'combined') {",
     "  degs <- results$deg_all_tbl",
-    "  w <- volcano_plot(degs, paste0('DEGSmith: all cell types | ', cond1, ' vs ', cond2))",
+    "  title <- if (comparison_mode == 'population') {",
+    "    paste0('DEGSmith: ', comparison_label)",
+    "  } else {",
+    "    paste0('DEGSmith: all cell types | ', comparison_label)",
+    "  }",
+    "  w <- volcano_plot(degs, title)",
     "  if (!is.null(w)) print(w) else cat('No DEGs to plot.\\n')",
     "",
     "} else {",
     "  for (ct in names(plot_list)) {",
     "    degs <- plot_list[[ct]]",
     "    if (is.null(degs) || nrow(degs) == 0) next",
-    "    w <- volcano_plot(degs, paste0('DEGSmith: ', ct, ' | ', cond1, ' vs ', cond2))",
+    "    w <- volcano_plot(degs, make_title(ct))",
     "    cat('## ', ct, '\\n\\n', sep='')",
     "    if (!is.null(w)) print(w) else cat('No DEGs to plot.\\n')",
     "    cat('\\n\\n')",
@@ -207,12 +223,117 @@ render_degsmith_per_celltype <- function(out_dir,
   unlink(tmp_dir, recursive = TRUE, force = TRUE)
 }
 
+# add gene annotations helper function
+add_gene_annotations <- function(df, annotation_table = NULL) {
+  # annotation_table:
+  # Optional Excel annotation table (.xlsx) containing a required
+  # 'gene' column and any additional annotation columns to append
+  # to DEG/marker tables.
+  #
+  # Special behavior:
+  # If a column named 'zfin_id' exists, a clickable Excel hyperlink
+  # column named 'zfin_link' will automatically be generated.
+  
+  if (is.null(annotation_table) || nrow(df) == 0) {
+    return(df)
+  }
+  
+  if (!"gene" %in% colnames(annotation_table)) {
+    stop("annotation_table must contain a column named 'gene'.")
+  }
+  
+  annotation_table <- annotation_table %>%
+    mutate(gene = as.character(gene)) %>%
+    distinct(gene, .keep_all = TRUE)
+  
+  # Only generate ZFIN hyperlinks if zfin_id exists
+  if ("zfin_id" %in% colnames(annotation_table)) {
+    zfin_formula <- ifelse(
+      !is.na(annotation_table$zfin_id) &
+        annotation_table$zfin_id != "",
+      
+      paste0(
+        '=HYPERLINK("https://zfin.org/',
+        annotation_table$zfin_id,
+        '","',
+        annotation_table$zfin_id,
+        '")'
+      ),
+      
+      ""
+    )
+    
+    class(zfin_formula) <- c("formula", "character")
+    
+    annotation_table$zfin_link <- zfin_formula
+  }
+  
+  df %>%
+    mutate(gene = as.character(gene)) %>%
+    dplyr::left_join(annotation_table, by = "gene")
+}
+
+#excel file naming
+make_excel_sheet_names <- function(x, max_len = 31) {
+  x <- as.character(x)
+  x <- gsub("[\\[\\]\\*\\?/\\\\:]", "_", x)  # illegal Excel chars
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_+|_+$", "", x)
+  x[!nzchar(x)] <- "Sheet"
+  
+  out <- character(length(x))
+  seen <- character()
+  
+  for (i in seq_along(x)) {
+    base <- substr(x[i], 1, max_len)
+    candidate <- base
+    k <- 1
+    
+    while (candidate %in% seen) {
+      suffix <- paste0("_", k)
+      candidate <- paste0(substr(base, 1, max_len - nchar(suffix)), suffix)
+      k <- k + 1
+    }
+    
+    out[i] <- candidate
+    seen <- c(seen, candidate)
+  }
+  
+  out
+}
+
+#helper function for one table and multiple tables
+write_xlsx_with_formulas <- function(df, path) {
+  wb <- openxlsx::createWorkbook()
+  sheet_name <- make_excel_sheet_names("Sheet1")
+  
+  openxlsx::addWorksheet(wb, sheet_name)
+  openxlsx::writeData(wb, sheet_name, df)
+  openxlsx::saveWorkbook(wb, path, overwrite = TRUE)
+}
+
+write_xlsx_list_with_formulas <- function(sheets, path) {
+  wb <- openxlsx::createWorkbook()
+  
+  safe_names <- make_excel_sheet_names(names(sheets))
+  
+  for (i in seq_along(sheets)) {
+    openxlsx::addWorksheet(wb, safe_names[i])
+    openxlsx::writeData(wb, safe_names[i], sheets[[i]])
+  }
+  
+  openxlsx::saveWorkbook(wb, path, overwrite = TRUE)
+}
+
 cellTypeDE <- function(seurat_obj,
                        seurat_format = c("auto", "rds", "rdata", "qs2"),
                        output_dir,
-                       cell_types,
-                       condition_1,
-                       condition_2,
+                       cell_types = NULL,
+                       condition_1 = NULL,
+                       condition_2 = NULL,
+                       comparison_mode = c("condition", "population"),
+                       population_1 = NULL,
+                       population_2 = NULL,
                        cond_col = "orig.ident",
                        celltype_col = "annotation",
                        de_assay = NA,
@@ -239,8 +360,10 @@ cellTypeDE <- function(seurat_obj,
                        make_report = FALSE,
                        render_report = FALSE,
                        report_title = "DEGSmith Volcano Plots",
-                       report_mode = c("per_celltype", "combined")) {
+                       report_mode = c("per_celltype", "combined"),
+                       annotation_table = NULL) {
   seurat_format <- match.arg(seurat_format)
+  comparison_mode <- match.arg(comparison_mode)
   
   ## ---- read seurat object (rds / RData / qs2) ---- ##
   in_path <- seurat_obj
@@ -254,7 +377,7 @@ cellTypeDE <- function(seurat_obj,
   if (fmt == "auto") {
     fmt <- dplyr::case_when(
       ext == "rds"                    ~ "rds",
-      ext %in% c("RData", "rda")      ~ "RData",
+      ext %in% c("rdata", "rda")      ~ "rdata",
       ext == "qs2"                     ~ "qs2",
       TRUE                            ~ NA_character_
     )
@@ -271,7 +394,7 @@ cellTypeDE <- function(seurat_obj,
   if (fmt == "rds") {
     seurat_obj <- readRDS(in_path)
     
-  } else if (fmt == "RData") {
+  } else if (fmt == "rdata") {
     temp_env <- new.env()
     load(in_path, envir = temp_env)
     
@@ -302,13 +425,15 @@ cellTypeDE <- function(seurat_obj,
   }
   
   volcano_table <- match.arg(volcano_table) #accepts exactly one of those choices
+  
   report_mode <- match.arg(report_mode)
   
   ## ---- checks ---- ##
   if (!inherits(seurat_obj, "Seurat"))
     stop("The input must be a Seurat object.")
   
-  if (!cond_col %in% colnames(seurat_obj@meta.data)) {
+  if (comparison_mode == "condition" &&
+      !cond_col %in% colnames(seurat_obj@meta.data)) {
     stop(
       "cond_col='",
       cond_col,
@@ -334,65 +459,100 @@ cellTypeDE <- function(seurat_obj,
     )
   }
   
-  # Parse cell types input:
-  # - comma-separated list, OR
-  # - the literal 'all' (case-insensitive) to use all cell types present in celltype_col
-  cell_types_raw <- cell_types
-  
-  if (length(cell_types_raw) == 1 &&
-      tolower(trimws(cell_types_raw)) == "all") {
-    cell_types <- seurat_obj@meta.data[[celltype_col]] %>%
-      as.character() %>%
-      trimws() %>%
-      discard( ~ is.na(.x) || .x == "")
+  if (comparison_mode == "condition") {
+    # Parse cell types input:
+    # - comma-separated list, OR
+    # - the literal 'all' to use all cell types in celltype_col
+    cell_types_raw <- cell_types
     
-    cell_types <- sort(unique(cell_types))
-    
-    message(
-      "cell_types='all' detected. Using all cell types (n=",
-      length(cell_types),
-      "): ",
-      paste(cell_types, collapse = ", ")
-    )
-    
-  } else {
-    # normal behavior: allow comma-separated string or vector
-    if (length(cell_types_raw) == 1 && grepl(",", cell_types_raw)) {
-      cell_types <- strsplit(cell_types_raw, ",")[[1]] %>% trimws()
+    if (length(cell_types_raw) == 1 &&
+        tolower(trimws(cell_types_raw)) == "all") {
+      cell_types <- seurat_obj@meta.data[[celltype_col]] %>%
+        as.character() %>%
+        trimws() %>%
+        discard( ~ is.na(.x) || .x == "")
+      
+      cell_types <- sort(unique(cell_types))
+      
+      message(
+        "cell_types='all' detected. Using all cell types (n=",
+        length(cell_types),
+        "): ",
+        paste(cell_types, collapse = ", ")
+      )
+      
     } else {
-      cell_types <- as.character(cell_types_raw) %>% trimws()
+      if (length(cell_types_raw) == 1 && grepl(",", cell_types_raw)) {
+        cell_types <- strsplit(cell_types_raw, ",")[[1]] %>% trimws()
+      } else {
+        cell_types <- as.character(cell_types_raw) %>% trimws()
+      }
+      
+      cell_types <- cell_types %>% discard( ~ is.na(.x) || .x == "")
+    }
+  }
+  
+  if (comparison_mode == "condition") {
+    # pre-filter cell types that don't have enough cells in BOTH conditions
+    counts_by_ct_cond <- seurat_obj@meta.data %>%
+      as_tibble() %>%
+      mutate(ct = as.character(.data[[celltype_col]]), cond = as.character(.data[[cond_col]])) %>%
+      filter(!is.na(ct), ct != "", !is.na(cond), cond != "") %>%
+      count(ct, cond, name = "n")
+    
+    eligible_ct <- counts_by_ct_cond %>%
+      filter(cond %in% c(condition_1, condition_2)) %>%
+      tidyr::pivot_wider(
+        names_from = cond,
+        values_from = n,
+        values_fill = 0
+      ) %>%
+      filter(.data[[condition_1]] >= min_cells_per_group,
+             .data[[condition_2]] >= min_cells_per_group) %>%
+      pull(ct)
+    
+    dropped <- setdiff(cell_types, eligible_ct)
+    if (length(dropped) > 0) {
+      message(
+        "Skipping ",
+        length(dropped),
+        " cell types due to min_cells_per_group in BOTH conditions: ",
+        paste(dropped, collapse = ", ")
+      )
+    }
+    cell_types <- intersect(cell_types, eligible_ct)
+    if (length(cell_types) == 0) {
+      stop("No requested cell types passed min_cells_per_group in both conditions.")
+    }
+  } else {
+    if (is.null(population_1) || is.null(population_2)) {
+      stop("For comparison_mode='population', provide population_1 and population_2.")
     }
     
-    cell_types <- cell_types %>% discard( ~ is.na(.x) || .x == "")
+    pop_counts <- seurat_obj@meta.data %>%
+      as_tibble() %>%
+      mutate(pop = as.character(.data[[celltype_col]])) %>%
+      count(pop, name = "n")
+    
+    n1 <- pop_counts$n[match(population_1, pop_counts$pop)]
+    n2 <- pop_counts$n[match(population_2, pop_counts$pop)]
+    
+    if (is.na(n1) || is.na(n2) ||
+        n1 < min_cells_per_group || n2 < min_cells_per_group) {
+      stop(
+        "Too few cells for population comparison: ",
+        population_1,
+        "=",
+        n1 %||% 0,
+        ", ",
+        population_2,
+        "=",
+        n2 %||% 0
+      )
+    }
+    
+    cell_types <- paste0(population_1, "_vs_", population_2)
   }
-  
-  # pre-filter cell types that don't have enough cells in BOTH conditions
-  counts_by_ct_cond <- seurat_obj@meta.data %>%
-    as_tibble() %>%
-    mutate(ct = as.character(.data[[celltype_col]]), cond = as.character(.data[[cond_col]])) %>%
-    filter(!is.na(ct), ct != "", !is.na(cond), cond != "") %>%
-    count(ct, cond, name = "n")
-  
-  eligible_ct <- counts_by_ct_cond %>%
-    filter(cond %in% c(condition_1, condition_2)) %>%
-    tidyr::pivot_wider(
-      names_from = cond,
-      values_from = n,
-      values_fill = 0
-    ) %>%
-    filter(.data[[condition_1]] >= min_cells_per_group, .data[[condition_2]] >= min_cells_per_group) %>%
-    pull(ct)
-  
-  dropped <- setdiff(cell_types, eligible_ct)
-  if (length(dropped) > 0) {
-    message(
-      "Skipping ",
-      length(dropped),
-      " cell types due to min_cells_per_group in BOTH conditions: ",
-      paste(dropped, collapse = ", ")
-    )
-  }
-  cell_types <- eligible_ct
   
   # File-name safe tag
   safe_tag <- function(x) {
@@ -409,15 +569,20 @@ cellTypeDE <- function(seurat_obj,
   out_dir <- file.path(output_dir, paste0(prefix, "DEGSmith_", timestamp))
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   
+  if (comparison_mode == "condition") {
+    contrast_1_global <- condition_1
+    contrast_2_global <- condition_2
+    comparison_label <- paste0(condition_1, " vs ", condition_2, " within cell type")
+  } else {
+    contrast_1_global <- population_1
+    contrast_2_global <- population_2
+    comparison_label <- paste0(population_1, " vs ", population_2)
+  }
+  
   message("Output folder: ", out_dir)
   message("Cell types: ", paste(cell_types, collapse = ", "))
-  message("Compare within cell type: ",
-          condition_1,
-          " vs ",
-          condition_2,
-          " (",
-          cond_col,
-          ")")
+  message("Comparison mode: ", comparison_mode)
+  message("Comparison: ", comparison_label)
   message("Cell type column: ", celltype_col)
   
   ## ---- interpret assay/slot NA -> NULL (so Seurat defaults if not set) ---- ##
@@ -441,16 +606,39 @@ cellTypeDE <- function(seurat_obj,
   
   meta_tbl <- seurat_obj@meta.data %>% as_tibble(rownames = "cell_id")
   
+  Idents(seurat_obj) <- seurat_obj@meta.data[[celltype_col]]
   for (ct in cell_types) {
     message("----- ", ct, " -----")
     
     # Cells for within-cell-type DE
-    cells_1 <- meta_tbl %>%
-      filter(.data[[celltype_col]] == ct, .data[[cond_col]] == condition_1) %>%
-      pull(cell_id)
-    cells_2 <- meta_tbl %>%
-      filter(.data[[celltype_col]] == ct, .data[[cond_col]] == condition_2) %>%
-      pull(cell_id)
+    if (comparison_mode == "condition") {
+      cells_1 <- meta_tbl %>%
+        filter(.data[[celltype_col]] == ct, .data[[cond_col]] == condition_1) %>%
+        pull(cell_id)
+      
+      cells_2 <- meta_tbl %>%
+        filter(.data[[celltype_col]] == ct, .data[[cond_col]] == condition_2) %>%
+        pull(cell_id)
+      
+      contrast_1 <- condition_1
+      contrast_2 <- condition_2
+      marker_ct_1 <- ct
+      marker_ct_2 <- ct
+      
+    } else {
+      cells_1 <- meta_tbl %>%
+        filter(.data[[celltype_col]] == population_1) %>%
+        pull(cell_id)
+      
+      cells_2 <- meta_tbl %>%
+        filter(.data[[celltype_col]] == population_2) %>%
+        pull(cell_id)
+      
+      contrast_1 <- population_1
+      contrast_2 <- population_2
+      marker_ct_1 <- population_1
+      marker_ct_2 <- population_2
+    }
     
     if (length(cells_1) < min_cells_per_group ||
         length(cells_2) < min_cells_per_group) {
@@ -458,9 +646,9 @@ cellTypeDE <- function(seurat_obj,
         sprintf(
           "[%s] Too few cells: %s=%d, %s=%d. DEG will be empty.",
           ct,
-          condition_1,
+          contrast_1,
           length(cells_1),
-          condition_2,
+          contrast_2,
           length(cells_2)
         )
       )
@@ -480,14 +668,15 @@ cellTypeDE <- function(seurat_obj,
         arrange(desc(avg_log2FC))
     }
     
+    deg_tbl <- add_gene_annotations(deg_tbl, annotation_table)
+    
     deg_list[[ct]] <- deg_tbl
     
-    # Markers: cell type vs rest
-    Idents(seurat_obj) <- seurat_obj@meta.data[[celltype_col]]
+    # Markers: contrast-specific population markers vs rest
     
-    marker_tbl <- FindMarkers(
+    marker_tbl_1 <- FindMarkers(
       object = seurat_obj,
-      ident.1 = ct,
+      ident.1 = marker_ct_1,
       ident.2 = NULL,
       assay = marker_assay,
       slot = marker_slot,
@@ -499,16 +688,57 @@ cellTypeDE <- function(seurat_obj,
       rownames_to_column("gene") %>%
       arrange(desc(avg_log2FC))
     
-    marker_list[[ct]] <- marker_tbl
+    marker_tbl_1 <- add_gene_annotations(marker_tbl_1, annotation_table)
     
-    marker_keep <- marker_tbl %>%
+    marker_keep_1 <- marker_tbl_1 %>%
       filter(avg_log2FC >= marker_logfc_cutoff,
              p_val_adj <= marker_padj_cutoff)
-    marker_keep_list[[ct]] <- marker_keep
     
-    # Specific DEGs = overlap(DEGs, marker_keep)
+    
+    if (marker_ct_2 == marker_ct_1) {
+      marker_tbl_2 <- marker_tbl_1
+      marker_keep_2 <- marker_keep_1
+    } else {
+      marker_tbl_2 <- FindMarkers(
+        object = seurat_obj,
+        ident.1 = marker_ct_2,
+        ident.2 = NULL,
+        assay = marker_assay,
+        slot = marker_slot,
+        test.use = test_use,
+        only.pos = marker_only_pos,
+        min.pct = marker_min_pct,
+        logfc.threshold = marker_logfc_threshold
+      ) %>%
+        rownames_to_column("gene") %>%
+        arrange(desc(avg_log2FC))
+      
+      marker_tbl_2 <- add_gene_annotations(marker_tbl_2, annotation_table)
+      
+      marker_keep_2 <- marker_tbl_2 %>%
+        filter(avg_log2FC >= marker_logfc_cutoff,
+               p_val_adj <= marker_padj_cutoff)
+    }
+    
+    marker_list[[ct]] <- list(
+      contrast_1_markers = marker_tbl_1,
+      contrast_2_markers = marker_tbl_2
+    )
+    
+    marker_keep_list[[ct]] <- list(
+      contrast_1_markers_keep = marker_keep_1,
+      contrast_2_markers_keep = marker_keep_2
+    )
+    
+    # Direction-aware specific DEGs:
+    # positive logFC = higher in contrast_1, so require marker of marker_ct_1
+    # negative logFC = higher in contrast_2, so require marker of marker_ct_2
     deg_specific <- deg_tbl %>%
-      filter(gene %in% marker_keep$gene)
+      filter(
+        (avg_log2FC > 0 & gene %in% marker_keep_1$gene) |
+          (avg_log2FC < 0 & gene %in% marker_keep_2$gene)
+      )
+    
     deg_specific_list[[ct]] <- deg_specific
     
     deg_specific_filtered <- deg_specific %>%
@@ -521,52 +751,48 @@ cellTypeDE <- function(seurat_obj,
     # Write per-celltype files
     ct_tag <- safe_tag(ct)
     
-    writexl::write_xlsx(deg_tbl, path = file.path(
+    if (comparison_mode == "population") {
+      file_tag <- paste0(safe_tag(contrast_1), "_vs_", safe_tag(contrast_2))
+    } else {
+      file_tag <- paste0(ct_tag, "_", safe_tag(contrast_1), "_vs_", safe_tag(contrast_2))
+    }
+    
+    write_xlsx_with_formulas(deg_tbl, file.path(
       out_dir,
-      paste0(
-        prefix,
-        "DEG_",
-        ct_tag,
-        "_",
-        condition_1,
-        "_vs_",
-        condition_2,
-        ".xlsx"
-      )
+      paste0(prefix, "DEG_", file_tag, ".xlsx")
     ))
     
-    writexl::write_xlsx(
-      list(markers_all = marker_tbl, markers_keep = marker_keep),
-      path = file.path(
+    write_xlsx_list_with_formulas(
+      list(
+        contrast_1_markers_all = marker_tbl_1,
+        contrast_1_markers_keep = marker_keep_1,
+        contrast_2_markers_all = marker_tbl_2,
+        contrast_2_markers_keep = marker_keep_2
+      ),
+      file.path(
         out_dir,
-        paste0(prefix, "Markers_", ct_tag, "_vs_rest.xlsx")
+        paste0(
+          prefix,
+          "Markers_",
+          safe_tag(marker_ct_1),
+          "_and_",
+          safe_tag(marker_ct_2),
+          "_vs_rest.xlsx"
+        )
       )
     )
     
-    writexl::write_xlsx(deg_specific, path = file.path(
+    write_xlsx_with_formulas(deg_specific, file.path(
       out_dir,
-      paste0(
-        prefix,
-        "DEG_specific_",
-        ct_tag,
-        "_",
-        condition_1,
-        "_vs_",
-        condition_2,
-        ".xlsx"
-      )
+      paste0(prefix, "DEG_specific_", file_tag, ".xlsx")
     ))
     
-    writexl::write_xlsx(deg_specific_filtered, path = file.path(
+    write_xlsx_with_formulas(deg_specific_filtered, path = file.path(
       out_dir,
       paste0(
         prefix,
         "DEG_specific_filtered_",
-        ct_tag,
-        "_",
-        condition_1,
-        "_vs_",
-        condition_2,
+        file_tag,
         "_logfc",
         celltype_deg_logfc_cutoff,
         "_padj",
@@ -574,6 +800,7 @@ cellTypeDE <- function(seurat_obj,
         ".xlsx"
       )
     ))
+    
   }
   
   # Choose which table is used for volcano/report
@@ -600,8 +827,14 @@ cellTypeDE <- function(seurat_obj,
     volcano_table = volcano_table,
     params = list(
       cell_types = cell_types,
+      comparison_mode = comparison_mode,
+      population_1 = population_1,
+      population_2 = population_2,
       condition_1 = condition_1,
       condition_2 = condition_2,
+      contrast_1 = contrast_1_global,
+      contrast_2 = contrast_2_global,
+      comparison_label = comparison_label,
       cond_col = cond_col,
       celltype_col = celltype_col,
       test_use = test_use,
@@ -665,7 +898,7 @@ cellTypeDE <- function(seurat_obj,
           # plots are based on volcano_source_list
           safe_tag = safe_tag
         )
-        message("Rendered per-cell-type HTML files in: ", out_dir)
+        message("Rendered per-cell-type interactive volcano plot in: ", file.path(out_dir, "plots"))
         
       } else {
         # single combined HTML
@@ -690,11 +923,12 @@ cellTypeDE <- function(seurat_obj,
     for (ct in names(deg_list)) {
       ct_tag <- safe_tag(ct)
       sheets[[paste0(ct_tag, "_DEG")]] <- deg_list[[ct]]
-      sheets[[paste0(ct_tag, "_MarkersKeep")]] <- marker_keep_list[[ct]]
+      sheets[[paste0(ct_tag, "_MarkersKeep_1")]] <- marker_keep_list[[ct]]$contrast_1_markers_keep
+      sheets[[paste0(ct_tag, "_MarkersKeep_2")]] <- marker_keep_list[[ct]]$contrast_2_markers_keep
       sheets[[paste0(ct_tag, "_SpecificDEG")]] <- deg_specific_list[[ct]]
       sheets[[paste0(ct_tag, "_SpecificDEG_Filtered")]] <- deg_specific_filtered_list[[ct]]
     }
-    writexl::write_xlsx(sheets, path = file.path(out_dir, paste0(prefix, "combined_cellTypeDE.xlsx")))
+    write_xlsx_list_with_formulas(sheets, path = file.path(out_dir, paste0(prefix, "combined_cellTypeDE.xlsx")))
   }
   
   message("Done.")
@@ -737,6 +971,26 @@ option_list <- list(
     type = "character",
     default = "./",
     help = "Directory to save the output files"
+  ),
+  make_option(
+    c("--comparison_mode"),
+    type = "character",
+    default = "condition",
+    help = "'condition' or 'population'"
+  ),
+  
+  make_option(
+    c("--population_1"),
+    type = "character",
+    default = NULL,
+    help = "Cell population 1 for population-vs-population DE"
+  ),
+  
+  make_option(
+    c("--population_2"),
+    type = "character",
+    default = NULL,
+    help = "Cell population 2 for population-vs-population DE"
   ),
   make_option(
     c("--cell_types"),
@@ -928,6 +1182,20 @@ option_list <- list(
     type = "character",
     default = "",
     help = "Filename prefix (default: empty)"
+  ),
+  
+  #add annotation
+  make_option(
+    c("--annotation_table"),
+    type = "character",
+    default = NULL,
+    help = paste(
+      "Optional Excel annotation table (.xlsx) containing a required",
+      "'gene' column and any additional annotation columns to append",
+      "to DEG/marker outputs.",
+      "If a column named 'zfin_id' exists, clickable ZFIN hyperlinks",
+      "will automatically be added as 'zfin_link'."
+    )
   )
 )
 
@@ -935,17 +1203,40 @@ opt_parser <- OptionParser(option_list = option_list, description = description_
 opt <- parse_args(opt_parser)
 
 ## ===== check the input parameters ===== ##
-required <- c("seurat_obj",
-              "cell_types",
-              "condition_1",
-              "condition_2",
-              "output_dir")
+required <- c("seurat_obj", "output_dir")
+
+if (opt$comparison_mode == "condition") {
+  required <- c(required, "cell_types", "condition_1", "condition_2")
+} else if (opt$comparison_mode == "population") {
+  required <- c(required, "population_1", "population_2")
+}
 missing <- required[map_lgl(required, ~ is.null(opt[[.x]]) ||
                               !nzchar(opt[[.x]]))]
 if (any(missing)) {
   print_help(opt_parser)
-  stop("Missing required arguments: ",
-       paste(required[missing], collapse = ", "))
+  stop("Missing required arguments: ", paste(missing, collapse = ", "))
+}
+
+annotation_table <- NULL
+
+if (!is.null(opt$annotation_table) &&
+    nzchar(opt$annotation_table)) {
+  ext_ann <- tolower(tools::file_ext(opt$annotation_table))
+  
+  if (ext_ann != "xlsx") {
+    stop("annotation_table must be an .xlsx file")
+  }
+  
+  if (!requireNamespace("readxl", quietly = TRUE)) {
+    stop("Package 'readxl' is required to read annotation_table .xlsx files")
+  }
+  
+  annotation_table <- readxl::read_xlsx(opt$annotation_table)
+}
+
+if (!is.null(annotation_table) &&
+    !"gene" %in% colnames(annotation_table)) {
+  stop("annotation_table must contain a column named 'gene'.")
 }
 
 ## ===== run ===== ##
@@ -953,6 +1244,9 @@ cellTypeDE(
   seurat_obj = opt$seurat_obj,
   seurat_format = opt$seurat_format,
   output_dir = opt$output_dir,
+  comparison_mode = opt$comparison_mode,
+  population_1 = opt$population_1,
+  population_2 = opt$population_2,
   cell_types = opt$cell_types,
   condition_1 = opt$condition_1,
   condition_2 = opt$condition_2,
@@ -982,5 +1276,6 @@ cellTypeDE(
   report_mode = opt$report_mode,
   volcano_logfc = opt$volcano_logfc,
   volcano_padj = opt$volcano_padj,
-  volcano_table = opt$volcano_table
+  volcano_table = opt$volcano_table,
+  annotation_table = annotation_table
 )
