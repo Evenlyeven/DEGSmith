@@ -4,10 +4,12 @@
 
 # DEGSmith: Cell-Type–Specific Differential Expression Pipeline for Seurat
 
-**DEGSmith** is a command-line R pipeline for performing cell-type–resolved differential expression (DE) analysis from Seurat objects.
+**DEGSmith** is a command-line R pipeline for performing cell-type–resolved differential expression (DE) analysis from Seurat objects. It supports two comparison modes:
 
+- **`condition` mode** — compares two experimental conditions within each cell type
+- **`population` mode** — directly compares two cell populations against each other
 
-For each selected cell type, it computes:  
+For each selected cell type (in `condition` mode), it computes:  
 	1.	**Within-cell-type DE**  
 (cell type, condition_1) vs (cell type, condition_2)  
 	2.	**Cell-type markers**  
@@ -15,18 +17,23 @@ For each selected cell type, it computes:
 	3.	**Cell-type–specific DEGs**  
 Overlap between DEGs and high-confidence markers  
 
+In `population` mode, it performs a single direct DE comparison between two named populations, along with markers for each population vs rest.
+
 Results are exported as Excel files and optionally rendered into interactive Plotly volcano HTML reports.
 
 ## 📦 Features
 
 	•	Accepts Seurat objects in `.rds`, `.RData`, or `.qs2` format
+	•	Two comparison modes: `condition` (within cell type) and `population` (cross-population)
 	•	Performs within-cell-type DE using `FindMarkers()`
 	•	Identifies cell-type markers (vs rest)
 	•	Derives cell-type–specific DEGs via marker overlap
 	•	Automatically filters low-cell-count groups
 	•	Exports per-cell-type Excel files
 	•	Generates a combined multi-sheet workbook
+	•	Optional gene annotation table with automatic ZFIN hyperlink generation
 	•	Optionally produces interactive volcano HTML reports
+	•	Click any point on the volcano plot to copy the gene name to clipboard
 	•	Fully command-line configurable
 	•	Timestamped output directory (prevents overwriting)
 
@@ -42,21 +49,27 @@ install.packages(c(
   "Seurat",
   "optparse",
   "magrittr",
-  "writexl",
+  "openxlsx",
   "rmarkdown",
   "plotly"
 ))
 ```
 
-If using .qs2 input:
+If using `.qs2` input:
 ```r
 install.packages("qs2")
 ```
 
+If using `--annotation_table`:
+```r
+install.packages("readxl")
+```
+
 ### 🖥️ Basic Usage
 
+**Condition mode** — DE between two conditions within each cell type:
 ```bash
-Rscript cellTypeDE.R \
+Rscript DEGSmith.R \
   --seurat_obj path/to/seurat_object.rds \
   --output_dir results/ \
   --cell_types T_cell,B_cell \
@@ -66,7 +79,7 @@ Rscript cellTypeDE.R \
 
 Use all cell types:
 ```bash
-Rscript cellTypeDE.R \
+Rscript DEGSmith.R \
   --seurat_obj path/to/seurat_object.qs2 \
   --output_dir results/ \
   --cell_types all \
@@ -74,9 +87,19 @@ Rscript cellTypeDE.R \
   --condition_2 Control
 ```
 
+**Population mode** — direct DE between two cell populations:
+```bash
+Rscript DEGSmith.R \
+  --seurat_obj path/to/seurat_object.rds \
+  --output_dir results/ \
+  --comparison_mode population \
+  --population_1 T_cell \
+  --population_2 B_cell
+```
+
 Generate interactive volcano report:
 ```bash
-Rscript cellTypeDE.R \
+Rscript DEGSmith.R \
   --seurat_obj path/to/seurat_object.qs2 \
   --output_dir results/ \
   --cell_types all \
@@ -88,7 +111,7 @@ Rscript cellTypeDE.R \
 
 ### 📝 Parameters
 
-**Required**
+**Required (condition mode)**
 | Parameter | Description |
 |-----------|-------------|
 | `--seurat_obj` | Path to Seurat object file (`.rds`, `.RData`, `.qs2`) |
@@ -96,6 +119,22 @@ Rscript cellTypeDE.R \
 | `--condition_1` | Condition A label used for DE comparison |
 | `--condition_2` | Condition B label used for DE comparison |
 | `--output_dir` | Directory where output files will be saved |
+
+**Required (population mode)**
+| Parameter | Description |
+|-----------|-------------|
+| `--seurat_obj` | Path to Seurat object file (`.rds`, `.RData`, `.qs2`) |
+| `--output_dir` | Directory where output files will be saved |
+| `--comparison_mode` | Set to `population` |
+| `--population_1` | Name of cell population 1 (value in `--celltype_col`) |
+| `--population_2` | Name of cell population 2 (value in `--celltype_col`) |
+
+**Comparison Mode**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--comparison_mode` | `condition` | Comparison mode: `condition` or `population` |
+| `--population_1` | `NULL` | Cell population 1 for population-vs-population DE |
+| `--population_2` | `NULL` | Cell population 2 for population-vs-population DE |
 
 **Input Format**
 | Parameter | Default | Description |
@@ -135,6 +174,11 @@ Rscript cellTypeDE.R \
 | `--celltype_deg_padj_cutoff`      | `0.05`  | Adjusted p-value cutoff for cell-type–specific DEGs |
 | `--min_cells_per_group`           | `10`    | Minimum cells per condition within a cell type |
 
+**Gene Annotation**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--annotation_table` | `NULL` | Path to `.xlsx` annotation file with a required `gene` column; any additional columns are appended to all DEG/marker tables. If a `zfin_id` column is present, clickable ZFIN hyperlinks are generated automatically. |
+
 **Volcano Report**
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -157,18 +201,22 @@ Rscript cellTypeDE.R \
 
 Each run creates a timestamped directory: `DEGSmith_20260212_153045/`  
 <br>
-**Per Cell Type**  
+**Per Cell Type (condition mode)**  
 	•	DEG_<celltype>_<cond1>_vs_<cond2>.xlsx  
 	•	Markers_<celltype>_vs_rest.xlsx  
-	•	markers_all  
-	•	markers_keep  
 	•	DEG_specific_<celltype>_<cond1>_vs_<cond2>.xlsx  
 	•	DEG_specific_filtered_<celltype>_...xlsx  
   <br>
-**Combined**  
-	•	combined_cellTypeDE.xlsx  
+**Population mode**  
+	•	DEG_<pop1>_vs_<pop2>.xlsx  
+	•	Markers_<pop1>_and_<pop2>_vs_rest.xlsx  
+	•	DEG_specific_<pop1>_vs_<pop2>.xlsx  
+	•	DEG_specific_filtered_<pop1>_vs_<pop2>_...xlsx  
+  <br>
+**Combined workbook sheets**  
 	•	<celltype>_DEG  
-	•	<celltype>_MarkersKeep  
+	•	<celltype>_MarkersKeep_1  
+	•	<celltype>_MarkersKeep_2  
 	•	<celltype>_SpecificDEG  
 	•	<celltype>_SpecificDEG_Filtered  
   <br>
@@ -179,10 +227,9 @@ Each run creates a timestamped directory: `DEGSmith_20260212_153045/`
 ## 📌 Notes
 
  - The Seurat object must contain the specified metadata columns.  
- - Only `SCT` assay is supported right now.  
+ - Only `SCT` assay is supported for marker detection by default.  
  - Cell types with insufficient cells per condition are automatically skipped.  
- - If multiple Seurat objects are present in an .RData file, the first one is used.  
- - Volcano plots are interactive (Plotly) with hover tooltips.  
+ - If multiple Seurat objects are present in an `.RData` file, the first one is used.  
+ - Volcano plots are interactive (Plotly) with hover tooltips. **Click any point to copy the gene name to clipboard** — a confirmation toast will appear briefly.  
+ - In `population` mode, `--cell_types`, `--condition_1`, and `--condition_2` are not required.  
  - Each run creates a new timestamped output folder to prevent overwriting.  
-
-
